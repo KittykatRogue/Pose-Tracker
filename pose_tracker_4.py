@@ -5,14 +5,47 @@ import urllib.request
 import os
 import time
 import math
+from collections import deque
 
 
 # =========================================================
-# SETTINGS
+# USER SETTINGS
 # =========================================================
 
-MARKER_ID = 0
-MARKER_SIZE_METERS = 0.10
+# Sway-box size in pixels
+# Increase these values to make the box larger.
+BOX_WIDTH_PIXELS = 200
+BOX_HEIGHT_PIXELS = 200
+
+# Calibration duration
+CALIBRATION_DURATION_SECONDS = 10
+
+# Activity thresholds in pixels/second
+# These may need adjustment depending on camera distance.
+STANDING_MAX_SPEED_PIXELS = 20
+RUNNING_MIN_SPEED_PIXELS = 250
+
+# Sidebar width
+SIDEBAR_WIDTH = 360
+
+
+# =========================================================
+# COLORS
+# =========================================================
+
+PURPLE = (255, 0, 255)
+RED = (0, 0, 255)
+GREEN = (0, 255, 0)
+WHITE = (255, 255, 255)
+YELLOW = (0, 255, 255)
+CYAN = (255, 255, 0)
+BLACK = (0, 0, 0)
+GRAY = (80, 80, 80)
+
+
+# =========================================================
+# MEDIAPIPE MODEL
+# =========================================================
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
@@ -72,24 +105,55 @@ def calculate_angle(point_a, point_b, point_c):
 
 
 def pixel_distance(point_a, point_b):
+    return math.dist(point_a, point_b)
+
+
+def classify_activity(speed_pixels_per_second):
     """
-    Calculates the distance between two image points in pixels.
+    Classifies motion using waist speed.
+
+    This is an approximate classifier.
     """
 
-    return math.dist(point_a, point_b)
+    if speed_pixels_per_second < STANDING_MAX_SPEED_PIXELS:
+        return "STANDING"
+
+    elif speed_pixels_per_second < RUNNING_MIN_SPEED_PIXELS:
+        return "WALKING"
+
+    else:
+        return "RUNNING"
 
 
 def draw_text(
     frame,
     text,
     location,
-    color=(255, 255, 255),
+    color=WHITE,
     scale=0.6
 ):
     cv2.putText(
         frame,
         text,
         location,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        2
+    )
+
+
+def sidebar_text(
+    panel,
+    text,
+    y_position,
+    color=WHITE,
+    scale=0.58
+):
+    cv2.putText(
+        panel,
+        text,
+        (20, y_position),
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
         color,
@@ -136,31 +200,6 @@ pose_options = PoseLandmarkerOptions(
 
 
 # =========================================================
-# SET UP ARUCO DETECTOR
-# =========================================================
-
-aruco_dictionary = cv2.aruco.getPredefinedDictionary(
-    cv2.aruco.DICT_4X4_50
-)
-
-try:
-    aruco_parameters = cv2.aruco.DetectorParameters()
-
-except AttributeError:
-    aruco_parameters = cv2.aruco.DetectorParameters_create()
-
-
-try:
-    aruco_detector = cv2.aruco.ArucoDetector(
-        aruco_dictionary,
-        aruco_parameters
-    )
-
-except AttributeError:
-    aruco_detector = None
-
-
-# =========================================================
 # BODY SEGMENTS
 # =========================================================
 
@@ -199,9 +238,15 @@ connections = [
 
 camera = cv2.VideoCapture(0)
 
-# Request a higher resolution
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+camera.set(
+    cv2.CAP_PROP_FRAME_WIDTH,
+    1280
+)
+
+camera.set(
+    cv2.CAP_PROP_FRAME_HEIGHT,
+    720
+)
 
 if not camera.isOpened():
 
@@ -213,11 +258,30 @@ if not camera.isOpened():
 # TRACKING VARIABLES
 # =========================================================
 
-previous_marker_center = None
-total_displacement_meters = 0.0
+# Ten-second calibration
+calibration_start_time = None
+calibration_samples = []
+calibration_complete = False
+sway_box_center = None
 
+# Waist tracking
+previous_waist_center = None
+previous_waist_time = None
+
+# Speed smoothing
+speed_history = deque(maxlen=15)
+smoothed_speed_pixels = 0.0
+
+# Displacement
+total_displacement_pixels = 0.0
+
+# Movement trail
 movement_trail = []
 
+# Activity
+activity_label = "WAITING"
+
+# Time
 start_time = time.monotonic()
 
 
@@ -239,159 +303,34 @@ with PoseLandmarker.create_from_options(
             break
 
 
-        # Do not flip the image.
-        # Flipping can prevent ArUco detection.
         height, width, _ = frame.shape
 
 
         # =================================================
-        # DETECT ARUCO MARKER
+        # DEFAULT MEASUREMENT VALUES
         # =================================================
 
-        if aruco_detector is not None:
+        left_thigh_text = "--"
+        right_thigh_text = "--"
+        left_shank_text = "--"
+        right_shank_text = "--"
 
-            marker_corners, marker_ids, rejected = (
-                aruco_detector.detectMarkers(frame)
-            )
+        left_knee_angle_text = "--"
+        right_knee_angle_text = "--"
 
-        else:
+        displacement_text = (
+            str(round(total_displacement_pixels, 1))
+            + " px"
+        )
 
-            marker_corners, marker_ids, rejected = (
-                cv2.aruco.detectMarkers(
-                    frame,
-                    aruco_dictionary,
-                    parameters=aruco_parameters
-                )
-            )
+        speed_text = (
+            str(round(smoothed_speed_pixels, 1))
+            + " px/s"
+        )
 
-
-        marker_detected = False
-        meters_per_pixel = None
-        current_marker_center = None
-
-
-        if marker_ids is not None:
-
-            for i, detected_id in enumerate(
-                marker_ids.flatten()
-            ):
-
-                if detected_id == MARKER_ID:
-
-                    marker_detected = True
-
-                    corners = marker_corners[i][0]
-
-                    # Draw yellow marker outline
-                    cv2.polylines(
-                        frame,
-                        [corners.astype(np.int32)],
-                        True,
-                        (0, 255, 255),
-                        3
-                    )
-
-                    # Marker center
-                    marker_x = int(
-                        np.mean(corners[:, 0])
-                    )
-
-                    marker_y = int(
-                        np.mean(corners[:, 1])
-                    )
-
-                    current_marker_center = (
-                        marker_x,
-                        marker_y
-                    )
-
-                    # Estimate marker width in pixels
-                    top_width = np.linalg.norm(
-                        corners[0] - corners[1]
-                    )
-
-                    bottom_width = np.linalg.norm(
-                        corners[2] - corners[3]
-                    )
-
-                    marker_width_pixels = (
-                        top_width + bottom_width
-                    ) / 2
-
-
-                    if marker_width_pixels > 0:
-
-                        meters_per_pixel = (
-                            MARKER_SIZE_METERS
-                            / marker_width_pixels
-                        )
-
-
-                    # Draw pink marker center
-                    cv2.circle(
-                        frame,
-                        current_marker_center,
-                        9,
-                        (255, 0, 255),
-                        -1
-                    )
-
-                    draw_text(
-                        frame,
-                        "ArUco ID 0 detected",
-                        (marker_x + 15, marker_y),
-                        color=(0, 255, 255)
-                    )
-
-
-                    # Calculate marker displacement
-                    if (
-                        previous_marker_center is not None
-                        and meters_per_pixel is not None
-                    ):
-
-                        frame_displacement_pixels = (
-                            pixel_distance(
-                                previous_marker_center,
-                                current_marker_center
-                            )
-                        )
-
-                        frame_displacement_meters = (
-                            frame_displacement_pixels
-                            * meters_per_pixel
-                        )
-
-                        total_displacement_meters += (
-                            frame_displacement_meters
-                        )
-
-
-                    previous_marker_center = (
-                        current_marker_center
-                    )
-
-
-                    # Store movement trail
-                    movement_trail.append(
-                        current_marker_center
-                    )
-
-                    if len(movement_trail) > 150:
-
-                        movement_trail.pop(0)
-
-
-                    # Draw movement trail
-                    for j in range(1, len(movement_trail)):
-
-                        cv2.line(
-                            frame,
-                            movement_trail[j - 1],
-                            movement_trail[j],
-                            (255, 0, 255),
-                            3
-                        )
+        sway_status = "Not calibrated"
+        calibration_status = "Waiting for person"
+        legs_status = "Not visible"
 
 
         # =================================================
@@ -418,9 +357,6 @@ with PoseLandmarker.create_from_options(
         )
 
 
-        legs_are_visible = False
-
-
         if pose_result.pose_landmarks:
 
             landmarks = pose_result.pose_landmarks[0]
@@ -442,13 +378,13 @@ with PoseLandmarker.create_from_options(
 
 
             # =================================================
-            # DRAW ONLY BODY JOINTS
+            # DRAW BODY JOINTS WITHOUT HEAD
             # =================================================
 
-            # Indices 0–10 include the face and head.
-            # Indices 11–32 are shoulders, arms, hips, legs,
-            # and feet.
+            # Landmarks 0–10 are head/face landmarks.
+            # Landmarks 11–32 are body landmarks.
             body_joint_indices = list(range(11, 33))
+
 
             for index in body_joint_indices:
 
@@ -460,7 +396,7 @@ with PoseLandmarker.create_from_options(
                         frame,
                         (x, y),
                         6,
-                        (0, 0, 255),
+                        RED,
                         -1
                     )
 
@@ -480,13 +416,13 @@ with PoseLandmarker.create_from_options(
                         frame,
                         (x1, y1),
                         (x2, y2),
-                        (0, 255, 0),
+                        GREEN,
                         3
                     )
 
 
             # =================================================
-            # DRAW PURPLE WAIST DOT
+            # CALCULATE WAIST CENTER
             # =================================================
 
             left_hip_x, left_hip_y, left_hip_visibility = (
@@ -519,12 +455,13 @@ with PoseLandmarker.create_from_options(
                     waist_y
                 )
 
-                # Purple waist dot
+
+                # Draw purple waist dot
                 cv2.circle(
                     frame,
                     waist_center,
                     11,
-                    (255, 0, 255),
+                    PURPLE,
                     -1
                 )
 
@@ -532,205 +469,359 @@ with PoseLandmarker.create_from_options(
                     frame,
                     "Waist",
                     (waist_x + 15, waist_y),
-                    color=(255, 0, 255)
-                )
-
-
-            # =================================================
-            # CHECK WHETHER LEG JOINTS ARE VISIBLE
-            # =================================================
-
-            required_leg_joints = [
-                23, 24, 25, 26, 27, 28
-            ]
-
-            legs_are_visible = all(
-                points[index][2] > 0.5
-                for index in required_leg_joints
-            )
-
-
-            # =================================================
-            # CALCULATE MEASUREMENTS
-            # =================================================
-
-            if (
-                marker_detected
-                and meters_per_pixel is not None
-                and legs_are_visible
-            ):
-
-                left_hip = points[23][:2]
-                right_hip = points[24][:2]
-
-                left_knee = points[25][:2]
-                right_knee = points[26][:2]
-
-                left_ankle = points[27][:2]
-                right_ankle = points[28][:2]
-
-
-                # Segment lengths in pixels
-                left_thigh_pixels = pixel_distance(
-                    left_hip,
-                    left_knee
-                )
-
-                right_thigh_pixels = pixel_distance(
-                    right_hip,
-                    right_knee
-                )
-
-                left_shank_pixels = pixel_distance(
-                    left_knee,
-                    left_ankle
-                )
-
-                right_shank_pixels = pixel_distance(
-                    right_knee,
-                    right_ankle
-                )
-
-
-                # Convert segment lengths to meters
-                left_thigh_meters = (
-                    left_thigh_pixels
-                    * meters_per_pixel
-                )
-
-                right_thigh_meters = (
-                    right_thigh_pixels
-                    * meters_per_pixel
-                )
-
-                left_shank_meters = (
-                    left_shank_pixels
-                    * meters_per_pixel
-                )
-
-                right_shank_meters = (
-                    right_shank_pixels
-                    * meters_per_pixel
-                )
-
-
-                # Knee angles
-                left_knee_angle = calculate_angle(
-                    left_hip,
-                    left_knee,
-                    left_ankle
-                )
-
-                right_knee_angle = calculate_angle(
-                    right_hip,
-                    right_knee,
-                    right_ankle
+                    color=PURPLE
                 )
 
 
                 # =================================================
-                # DISPLAY MEASUREMENTS
+                # CALCULATE WAIST SPEED AND DISPLACEMENT
                 # =================================================
 
-                measurement_x = 20
-                measurement_y = 155
+                current_time = time.monotonic()
 
-                draw_text(
-                    frame,
-                    "METRICS ACTIVE",
-                    (measurement_x, measurement_y),
-                    color=(0, 255, 0),
-                    scale=0.7
+
+                if (
+                    previous_waist_center is not None
+                    and previous_waist_time is not None
+                ):
+
+                    elapsed_time = (
+                        current_time
+                        - previous_waist_time
+                    )
+
+                    if elapsed_time > 0:
+
+                        frame_distance_pixels = (
+                            pixel_distance(
+                                previous_waist_center,
+                                waist_center
+                            )
+                        )
+
+                        current_speed_pixels = (
+                            frame_distance_pixels
+                            / elapsed_time
+                        )
+
+                        speed_history.append(
+                            current_speed_pixels
+                        )
+
+                        smoothed_speed_pixels = (
+                            0.8
+                            * smoothed_speed_pixels
+                            + 0.2
+                            * np.mean(speed_history)
+                        )
+
+                        total_displacement_pixels += (
+                            frame_distance_pixels
+                        )
+
+
+                previous_waist_center = waist_center
+                previous_waist_time = current_time
+
+
+                # =================================================
+                # TEN-SECOND CALIBRATION
+                # =================================================
+
+                if not calibration_complete:
+
+                    if calibration_start_time is None:
+
+                        calibration_start_time = (
+                            time.monotonic()
+                        )
+
+                        calibration_samples = []
+
+
+                    calibration_elapsed = (
+                        time.monotonic()
+                        - calibration_start_time
+                    )
+
+                    calibration_remaining = max(
+                        0,
+                        CALIBRATION_DURATION_SECONDS
+                        - calibration_elapsed
+                    )
+
+
+                    calibration_samples.append(
+                        waist_center
+                    )
+
+
+                    if (
+                        calibration_elapsed
+                        < CALIBRATION_DURATION_SECONDS
+                    ):
+
+                        activity_label = (
+                            "CALIBRATING"
+                        )
+
+                        calibration_status = (
+                            "Stand still"
+                        )
+
+                        sway_status = (
+                            "Box begins in "
+                            + str(
+                                round(
+                                    calibration_remaining,
+                                    1
+                                )
+                            )
+                            + " s"
+                        )
+
+
+                    else:
+
+                        # Average the waist position over the
+                        # full ten-second calibration period
+                        average_x = int(
+                            np.mean([
+                                point[0]
+                                for point in calibration_samples
+                            ])
+                        )
+
+                        average_y = int(
+                            np.mean([
+                                point[1]
+                                for point in calibration_samples
+                            ])
+                        )
+
+                        sway_box_center = (
+                            average_x,
+                            average_y
+                        )
+
+                        calibration_complete = True
+
+                        activity_label = "STANDING"
+                        calibration_status = "Complete"
+                        sway_status = "LOW SWAY"
+
+                        print(
+                            "Ten-second calibration complete."
+                        )
+
+
+                # =================================================
+                # ACTIVITY CLASSIFICATION
+                # =================================================
+
+                if calibration_complete:
+
+                    activity_label = classify_activity(
+                        smoothed_speed_pixels
+                    )
+
+
+                # =================================================
+                # DRAW SWAY BOX
+                # =================================================
+
+                if (
+                    calibration_complete
+                    and sway_box_center is not None
+                ):
+
+                    box_center_x = sway_box_center[0]
+                    box_center_y = sway_box_center[1]
+
+
+                    box_left = (
+                        box_center_x
+                        - int(BOX_WIDTH_PIXELS / 2)
+                    )
+
+                    box_right = (
+                        box_center_x
+                        + int(BOX_WIDTH_PIXELS / 2)
+                    )
+
+                    box_top = (
+                        box_center_y
+                        - int(BOX_HEIGHT_PIXELS / 2)
+                    )
+
+                    box_bottom = (
+                        box_center_y
+                        + int(BOX_HEIGHT_PIXELS / 2)
+                    )
+
+
+                    waist_inside_box = (
+                        box_left <= waist_center[0]
+                        <= box_right
+                        and
+                        box_top <= waist_center[1]
+                        <= box_bottom
+                    )
+
+
+                    if waist_inside_box:
+
+                        box_color = GREEN
+                        sway_status = "LOW SWAY"
+
+                    else:
+
+                        box_color = RED
+                        sway_status = "HIGH SWAY"
+
+
+                    cv2.rectangle(
+                        frame,
+                        (box_left, box_top),
+                        (box_right, box_bottom),
+                        box_color,
+                        3
+                    )
+
+
+                    # Box center
+                    cv2.circle(
+                        frame,
+                        sway_box_center,
+                        6,
+                        CYAN,
+                        -1
+                    )
+
+
+                # =================================================
+                # CHECK LEG VISIBILITY
+                # =================================================
+
+                required_leg_joints = [
+                    23, 24, 25, 26, 27, 28
+                ]
+
+                legs_are_visible = all(
+                    points[index][2] > 0.5
+                    for index in required_leg_joints
                 )
 
-                draw_text(
-                    frame,
-                    "Left thigh: "
-                    + str(round(left_thigh_meters, 3))
-                    + " m",
-                    (measurement_x, measurement_y + 32)
-                )
 
-                draw_text(
-                    frame,
-                    "Right thigh: "
-                    + str(round(right_thigh_meters, 3))
-                    + " m",
-                    (measurement_x, measurement_y + 62)
-                )
+                if legs_are_visible:
 
-                draw_text(
-                    frame,
-                    "Left shank: "
-                    + str(round(left_shank_meters, 3))
-                    + " m",
-                    (measurement_x, measurement_y + 92)
-                )
-
-                draw_text(
-                    frame,
-                    "Right shank: "
-                    + str(round(right_shank_meters, 3))
-                    + " m",
-                    (measurement_x, measurement_y + 122)
-                )
-
-                draw_text(
-                    frame,
-                    "Left knee angle: "
-                    + str(round(left_knee_angle, 1))
-                    + " deg",
-                    (measurement_x, measurement_y + 152)
-                )
-
-                draw_text(
-                    frame,
-                    "Right knee angle: "
-                    + str(round(right_knee_angle, 1))
-                    + " deg",
-                    (measurement_x, measurement_y + 182)
-                )
-
-                draw_text(
-                    frame,
-                    "Displacement: "
-                    + str(round(total_displacement_meters, 3))
-                    + " m",
-                    (measurement_x, measurement_y + 212),
-                    color=(255, 0, 255),
-                    scale=0.7
-                )
+                    legs_status = "Visible"
 
 
-            elif marker_detected and not legs_are_visible:
+                    # Coordinates of hips, knees, and ankles
+                    left_hip = points[23][:2]
+                    right_hip = points[24][:2]
 
-                draw_text(
-                    frame,
-                    "Marker detected, but legs are not visible",
-                    (20, 155),
-                    color=(0, 255, 255)
-                )
+                    left_knee = points[25][:2]
+                    right_knee = points[26][:2]
 
-
-            elif not marker_detected:
-
-                draw_text(
-                    frame,
-                    "Show ArUco marker to activate measurements",
-                    (20, 155),
-                    color=(0, 255, 255)
-                )
+                    left_ankle = points[27][:2]
+                    right_ankle = points[28][:2]
 
 
-        # =================================================
-        # GENERAL INFORMATION
-        # =================================================
+                    # Segment lengths in pixels
+                    left_thigh_pixels = pixel_distance(
+                        left_hip,
+                        left_knee
+                    )
+
+                    right_thigh_pixels = pixel_distance(
+                        right_hip,
+                        right_knee
+                    )
+
+                    left_shank_pixels = pixel_distance(
+                        left_knee,
+                        left_ankle
+                    )
+
+                    right_shank_pixels = pixel_distance(
+                        right_knee,
+                        right_ankle
+                    )
+
+
+                    left_thigh_text = (
+                        str(round(left_thigh_pixels, 1))
+                        + " px"
+                    )
+
+                    right_thigh_text = (
+                        str(round(right_thigh_pixels, 1))
+                        + " px"
+                    )
+
+                    left_shank_text = (
+                        str(round(left_shank_pixels, 1))
+                        + " px"
+                    )
+
+                    right_shank_text = (
+                        str(round(right_shank_pixels, 1))
+                        + " px"
+                    )
+
+
+                    # Knee angles
+                    left_knee_angle = calculate_angle(
+                        left_hip,
+                        left_knee,
+                        left_ankle
+                    )
+
+                    right_knee_angle = calculate_angle(
+                        right_hip,
+                        right_knee,
+                        right_ankle
+                    )
+
+
+                    if left_knee_angle is not None:
+
+                        left_knee_angle_text = (
+                            str(round(left_knee_angle, 1))
+                            + " deg"
+                        )
+
+
+                    if right_knee_angle is not None:
+
+                        right_knee_angle_text = (
+                            str(round(right_knee_angle, 1))
+                            + " deg"
+                        )
+
+
+                else:
+
+                    legs_status = "Not visible"
+
+
+        else:
+
+            activity_label = "NO PERSON DETECTED"
+            calibration_status = "No pose detected"
+
+
+        # =========================================================
+        # CAMERA-WINDOW INSTRUCTIONS
+        # =========================================================
 
         draw_text(
             frame,
-            "Press Q to quit",
+            "Press Q to quit | Press R to recalibrate",
             (20, 40),
-            scale=0.75
+            scale=0.7
         )
 
         draw_text(
@@ -742,25 +833,266 @@ with PoseLandmarker.create_from_options(
 
         draw_text(
             frame,
-            "Purple dot = waist | Yellow box = ArUco marker",
+            "Purple dot = waist | Box = sway region",
             (20, 105),
             scale=0.6
         )
 
-        cv2.imshow(
-            "Pose, Measurements, and Displacement",
-            frame
+
+        # =========================================================
+        # CREATE ALWAYS-VISIBLE SIDEBAR
+        # =========================================================
+
+        sidebar = np.zeros(
+            (height, SIDEBAR_WIDTH, 3),
+            dtype=np.uint8
+        )
+
+        sidebar[:] = (35, 35, 35)
+
+
+        # Sidebar title
+        sidebar_text(
+            sidebar,
+            "POSE MEASUREMENTS",
+            40,
+            color=CYAN,
+            scale=0.75
+        )
+
+        cv2.line(
+            sidebar,
+            (20, 55),
+            (SIDEBAR_WIDTH - 20, 55),
+            GRAY,
+            2
         )
 
 
-        # Press Q to close
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        # Activity information
+        sidebar_text(
+            sidebar,
+            "ACTIVITY",
+            90,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            activity_label,
+            120,
+            color=GREEN,
+            scale=0.8
+        )
+
+        sidebar_text(
+            sidebar,
+            "Speed: " + speed_text,
+            150
+        )
+
+
+        # Calibration information
+        sidebar_text(
+            sidebar,
+            "CALIBRATION",
+            200,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            calibration_status,
+            230
+        )
+
+        sidebar_text(
+            sidebar,
+            sway_status,
+            260,
+            color=GREEN if sway_status == "LOW SWAY"
+            else RED if sway_status == "HIGH SWAY"
+            else YELLOW
+        )
+
+
+        # Sway-box information
+        sidebar_text(
+            sidebar,
+            "SWAY BOX",
+            310,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            "Width: "
+            + str(BOX_WIDTH_PIXELS)
+            + " px",
+            340
+        )
+
+        sidebar_text(
+            sidebar,
+            "Height: "
+            + str(BOX_HEIGHT_PIXELS)
+            + " px",
+            370
+        )
+
+
+        # Displacement
+        sidebar_text(
+            sidebar,
+            "DISPLACEMENT",
+            420,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            "Waist path:",
+            450
+        )
+
+        sidebar_text(
+            sidebar,
+            displacement_text,
+            480,
+            color=PURPLE,
+            scale=0.75
+        )
+
+
+        # Segment lengths
+        sidebar_text(
+            sidebar,
+            "SEGMENT LENGTHS",
+            535,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            "Left thigh: " + left_thigh_text,
+            565
+        )
+
+        sidebar_text(
+            sidebar,
+            "Right thigh: " + right_thigh_text,
+            595
+        )
+
+        sidebar_text(
+            sidebar,
+            "Left shank: " + left_shank_text,
+            625
+        )
+
+        sidebar_text(
+            sidebar,
+            "Right shank: " + right_shank_text,
+            655
+        )
+
+
+        # Knee angles
+        sidebar_text(
+            sidebar,
+            "KNEE ANGLES",
+            705,
+            color=YELLOW,
+            scale=0.65
+        )
+
+        sidebar_text(
+            sidebar,
+            "Left: " + left_knee_angle_text,
+            735
+        )
+
+        sidebar_text(
+            sidebar,
+            "Right: " + right_knee_angle_text,
+            765
+        )
+
+
+        # Leg visibility note
+        sidebar_text(
+            sidebar,
+            "Legs: " + legs_status,
+            815,
+            color=GREEN if legs_status == "Visible"
+            else RED,
+            scale=0.6
+        )
+
+        sidebar_text(
+            sidebar,
+            "Lengths shown in pixels",
+            850,
+            color=CYAN,
+            scale=0.55
+        )
+
+
+        # Combine camera view and sidebar
+        combined_view = np.hstack(
+            (frame, sidebar)
+        )
+
+        cv2.imshow(
+            "Pose and Motion Tracker",
+            combined_view
+        )
+
+
+        # =========================================================
+        # KEYBOARD CONTROLS
+        # =========================================================
+
+        key = cv2.waitKey(1) & 0xFF
+
+
+        if key == ord("q"):
 
             break
 
 
+        elif key == ord("r"):
+
+            # Reset ten-second calibration
+            calibration_start_time = None
+            calibration_samples = []
+            calibration_complete = False
+            sway_box_center = None
+
+            # Reset displacement and movement
+            previous_waist_center = None
+            previous_waist_time = None
+            total_displacement_pixels = 0.0
+            movement_trail = []
+
+            # Reset activity
+            speed_history.clear()
+            smoothed_speed_pixels = 0.0
+            activity_label = "WAITING"
+
+            print(
+                "Calibration reset. "
+                "Stand still for 10 seconds."
+            )
+
+
 # =========================================================
-# CLOSE CAMERA
+# CLOSE PROGRAM
 # =========================================================
 
 camera.release()
