@@ -13,7 +13,6 @@ from collections import deque
 # =========================================================
 
 # Sway-box size in pixels
-# Increase these values to make the box larger.
 BOX_WIDTH_PIXELS = 200
 BOX_HEIGHT_PIXELS = 200
 
@@ -22,7 +21,7 @@ CALIBRATION_DURATION_SECONDS = 10
 
 # Activity thresholds in pixels/second
 # These may need adjustment depending on camera distance.
-STANDING_MAX_SPEED_PIXELS = 20
+STANDING_MAX_SPEED_PIXELS = 40
 RUNNING_MIN_SPEED_PIXELS = 250
 
 # Sidebar width
@@ -39,8 +38,8 @@ GREEN = (0, 255, 0)
 WHITE = (255, 255, 255)
 YELLOW = (0, 255, 255)
 CYAN = (255, 255, 0)
-BLACK = (0, 0, 0)
 GRAY = (80, 80, 80)
+DARK_GRAY = (35, 35, 35)
 
 
 # =========================================================
@@ -110,9 +109,7 @@ def pixel_distance(point_a, point_b):
 
 def classify_activity(speed_pixels_per_second):
     """
-    Classifies motion using waist speed.
-
-    This is an approximate classifier.
+    Approximate activity classifier.
     """
 
     if speed_pixels_per_second < STANDING_MAX_SPEED_PIXELS:
@@ -255,39 +252,54 @@ if not camera.isOpened():
 
 
 # =========================================================
+# DISPLAY WINDOW
+# =========================================================
+
+WINDOW_NAME = "Pose and Motion Tracker"
+
+cv2.namedWindow(
+    WINDOW_NAME,
+    cv2.WINDOW_NORMAL
+)
+
+# Start in full-screen mode
+cv2.setWindowProperty(
+    WINDOW_NAME,
+    cv2.WND_PROP_FULLSCREEN,
+    cv2.WINDOW_FULLSCREEN
+)
+
+fullscreen = True
+
+
+# =========================================================
 # TRACKING VARIABLES
 # =========================================================
 
-# Ten-second calibration
+# Calibration
 calibration_start_time = None
 calibration_samples = []
 calibration_complete = False
 sway_box_center = None
 
-# Waist tracking
-previous_waist_center = None
-previous_waist_time = None
+# Waist and ankle movement
+previous_motion_points = {}
+previous_motion_time = None
 
-# Speed smoothing
-speed_history = deque(maxlen=15)
+# Motion-speed smoothing
+speed_history = deque(maxlen=12)
 smoothed_speed_pixels = 0.0
-
-# Displacement
-total_displacement_pixels = 0.0
-
-# Movement trail
-movement_trail = []
 
 # Activity
 activity_label = "WAITING"
-
-# Time
-start_time = time.monotonic()
 
 
 # =========================================================
 # RUN PROGRAM
 # =========================================================
+
+start_time = time.monotonic()
+
 
 with PoseLandmarker.create_from_options(
     pose_options
@@ -307,7 +319,7 @@ with PoseLandmarker.create_from_options(
 
 
         # =================================================
-        # DEFAULT MEASUREMENT VALUES
+        # DEFAULT SIDEBAR VALUES
         # =================================================
 
         left_thigh_text = "--"
@@ -318,23 +330,19 @@ with PoseLandmarker.create_from_options(
         left_knee_angle_text = "--"
         right_knee_angle_text = "--"
 
-        displacement_text = (
-            str(round(total_displacement_pixels, 1))
-            + " px"
-        )
-
+        waist_displacement_text = "--"
         speed_text = (
             str(round(smoothed_speed_pixels, 1))
             + " px/s"
         )
 
+        calibration_status = "Waiting for pose"
         sway_status = "Not calibrated"
-        calibration_status = "Waiting for person"
         legs_status = "Not visible"
 
 
         # =================================================
-        # DETECT BODY POSE
+        # POSE DETECTION
         # =================================================
 
         rgb_frame = cv2.cvtColor(
@@ -381,8 +389,6 @@ with PoseLandmarker.create_from_options(
             # DRAW BODY JOINTS WITHOUT HEAD
             # =================================================
 
-            # Landmarks 0–10 are head/face landmarks.
-            # Landmarks 11–32 are body landmarks.
             body_joint_indices = list(range(11, 33))
 
 
@@ -401,7 +407,7 @@ with PoseLandmarker.create_from_options(
                     )
 
 
-            # Draw limb segments
+            # Draw body segments
             for joint_1, joint_2 in connections:
 
                 x1, y1, visibility_1 = points[joint_1]
@@ -422,7 +428,7 @@ with PoseLandmarker.create_from_options(
 
 
             # =================================================
-            # CALCULATE WAIST CENTER
+            # FIND WAIST CENTER
             # =================================================
 
             left_hip_x, left_hip_y, left_hip_visibility = (
@@ -474,58 +480,7 @@ with PoseLandmarker.create_from_options(
 
 
                 # =================================================
-                # CALCULATE WAIST SPEED AND DISPLACEMENT
-                # =================================================
-
-                current_time = time.monotonic()
-
-
-                if (
-                    previous_waist_center is not None
-                    and previous_waist_time is not None
-                ):
-
-                    elapsed_time = (
-                        current_time
-                        - previous_waist_time
-                    )
-
-                    if elapsed_time > 0:
-
-                        frame_distance_pixels = (
-                            pixel_distance(
-                                previous_waist_center,
-                                waist_center
-                            )
-                        )
-
-                        current_speed_pixels = (
-                            frame_distance_pixels
-                            / elapsed_time
-                        )
-
-                        speed_history.append(
-                            current_speed_pixels
-                        )
-
-                        smoothed_speed_pixels = (
-                            0.8
-                            * smoothed_speed_pixels
-                            + 0.2
-                            * np.mean(speed_history)
-                        )
-
-                        total_displacement_pixels += (
-                            frame_distance_pixels
-                        )
-
-
-                previous_waist_center = waist_center
-                previous_waist_time = current_time
-
-
-                # =================================================
-                # TEN-SECOND CALIBRATION
+                # CALIBRATE SWAY BOX
                 # =================================================
 
                 if not calibration_complete:
@@ -561,16 +516,8 @@ with PoseLandmarker.create_from_options(
                         < CALIBRATION_DURATION_SECONDS
                     ):
 
-                        activity_label = (
-                            "CALIBRATING"
-                        )
-
                         calibration_status = (
-                            "Stand still"
-                        )
-
-                        sway_status = (
-                            "Box begins in "
+                            "Stand still: "
                             + str(
                                 round(
                                     calibration_remaining,
@@ -580,11 +527,12 @@ with PoseLandmarker.create_from_options(
                             + " s"
                         )
 
+                        activity_label = "CALIBRATING"
+
 
                     else:
 
-                        # Average the waist position over the
-                        # full ten-second calibration period
+                        # Average waist location during calibration
                         average_x = int(
                             np.mean([
                                 point[0]
@@ -605,18 +553,104 @@ with PoseLandmarker.create_from_options(
                         )
 
                         calibration_complete = True
-
-                        activity_label = "STANDING"
                         calibration_status = "Complete"
-                        sway_status = "LOW SWAY"
-
-                        print(
-                            "Ten-second calibration complete."
-                        )
 
 
                 # =================================================
-                # ACTIVITY CLASSIFICATION
+                # TRACK WAIST, KNEES, AND ANKLES
+                # =================================================
+
+                current_motion_points = {
+                    "waist": waist_center
+                }
+
+
+                if points[27][2] > 0.5:
+
+                    current_motion_points["left_ankle"] = (
+                        points[27][0],
+                        points[27][1]
+                    )
+
+
+                if points[28][2] > 0.5:
+
+                    current_motion_points["right_ankle"] = (
+                        points[28][0],
+                        points[28][1]
+                    )
+
+
+                current_time = time.monotonic()
+
+
+                if previous_motion_time is not None:
+
+                    elapsed_time = (
+                        current_time
+                        - previous_motion_time
+                    )
+
+
+                    if elapsed_time > 0:
+
+                        current_speeds = []
+
+
+                        for name, current_point in (
+                            current_motion_points.items()
+                        ):
+
+                            if name in previous_motion_points:
+
+                                distance_pixels = (
+                                    pixel_distance(
+                                        previous_motion_points[name],
+                                        current_point
+                                    )
+                                )
+
+                                speed = (
+                                    distance_pixels
+                                    / elapsed_time
+                                )
+
+                                current_speeds.append(
+                                    speed
+                                )
+
+
+                        if len(current_speeds) > 0:
+
+                            # Use the fastest visible body point.
+                            # This helps running register better
+                            # because the ankles move faster than
+                            # the waist.
+                            current_motion_speed = max(
+                                current_speeds
+                            )
+
+                            speed_history.append(
+                                current_motion_speed
+                            )
+
+                            smoothed_speed_pixels = (
+                                0.75
+                                * smoothed_speed_pixels
+                                + 0.25
+                                * np.mean(speed_history)
+                            )
+
+
+                previous_motion_points = (
+                    current_motion_points
+                )
+
+                previous_motion_time = current_time
+
+
+                # =================================================
+                # ACTIVITY LABEL
                 # =================================================
 
                 if calibration_complete:
@@ -624,6 +658,12 @@ with PoseLandmarker.create_from_options(
                     activity_label = classify_activity(
                         smoothed_speed_pixels
                     )
+
+
+                speed_text = (
+                    str(round(smoothed_speed_pixels, 1))
+                    + " px/s"
+                )
 
 
                 # =================================================
@@ -689,13 +729,27 @@ with PoseLandmarker.create_from_options(
                     )
 
 
-                    # Box center
+                    # Draw box center
                     cv2.circle(
                         frame,
                         sway_box_center,
                         6,
                         CYAN,
                         -1
+                    )
+
+
+                    # Waist displacement from box center
+                    waist_displacement_pixels = (
+                        pixel_distance(
+                            waist_center,
+                            sway_box_center
+                        )
+                    )
+
+                    waist_displacement_text = (
+                        str(round(waist_displacement_pixels, 1))
+                        + " px"
                     )
 
 
@@ -718,7 +772,7 @@ with PoseLandmarker.create_from_options(
                     legs_status = "Visible"
 
 
-                    # Coordinates of hips, knees, and ankles
+                    # Joint coordinates
                     left_hip = points[23][:2]
                     right_hip = points[24][:2]
 
@@ -802,31 +856,26 @@ with PoseLandmarker.create_from_options(
                         )
 
 
-                else:
-
-                    legs_status = "Not visible"
-
-
         else:
 
             activity_label = "NO PERSON DETECTED"
             calibration_status = "No pose detected"
 
 
-        # =========================================================
-        # CAMERA-WINDOW INSTRUCTIONS
-        # =========================================================
+        # =================================================
+        # CAMERA VIEW TEXT
+        # =================================================
 
         draw_text(
             frame,
-            "Press Q to quit | Press R to recalibrate",
+            "Q: quit | R: recalibrate | F: fullscreen",
             (20, 40),
-            scale=0.7
+            scale=0.65
         )
 
         draw_text(
             frame,
-            "Red dots = body joints | Green lines = limbs",
+            "Red dots = joints | Green lines = limbs",
             (20, 75),
             scale=0.6
         )
@@ -839,92 +888,125 @@ with PoseLandmarker.create_from_options(
         )
 
 
-        # =========================================================
-        # CREATE ALWAYS-VISIBLE SIDEBAR
-        # =========================================================
+        # =================================================
+        # CREATE SIDEBAR
+        # =================================================
 
         sidebar = np.zeros(
             (height, SIDEBAR_WIDTH, 3),
             dtype=np.uint8
         )
 
-        sidebar[:] = (35, 35, 35)
+        sidebar[:] = DARK_GRAY
 
 
-        # Sidebar title
         sidebar_text(
             sidebar,
             "POSE MEASUREMENTS",
-            40,
+            35,
             color=CYAN,
             scale=0.75
         )
 
         cv2.line(
             sidebar,
-            (20, 55),
-            (SIDEBAR_WIDTH - 20, 55),
+            (20, 50),
+            (SIDEBAR_WIDTH - 20, 50),
             GRAY,
             2
         )
 
 
-        # Activity information
+        # Activity
         sidebar_text(
             sidebar,
             "ACTIVITY",
-            90,
+            85,
             color=YELLOW,
-            scale=0.65
+            scale=0.62
+        )
+
+        activity_color = (
+            GREEN
+            if activity_label == "STANDING"
+            else YELLOW
+            if activity_label == "WALKING"
+            else RED
+            if activity_label == "RUNNING"
+            else WHITE
         )
 
         sidebar_text(
             sidebar,
             activity_label,
-            120,
-            color=GREEN,
-            scale=0.8
+            115,
+            color=activity_color,
+            scale=0.78
         )
 
         sidebar_text(
             sidebar,
             "Speed: " + speed_text,
-            150
+            145
         )
 
 
-        # Calibration information
+        # Calibration
         sidebar_text(
             sidebar,
             "CALIBRATION",
-            200,
+            190,
             color=YELLOW,
-            scale=0.65
+            scale=0.62
         )
 
         sidebar_text(
             sidebar,
             calibration_status,
-            230
+            220
+        )
+
+
+        # Sway information
+        sidebar_text(
+            sidebar,
+            "SWAY",
+            265,
+            color=YELLOW,
+            scale=0.62
+        )
+
+        sway_color = (
+            GREEN
+            if sway_status == "LOW SWAY"
+            else RED
+            if sway_status == "HIGH SWAY"
+            else YELLOW
         )
 
         sidebar_text(
             sidebar,
             sway_status,
-            260,
-            color=GREEN if sway_status == "LOW SWAY"
-            else RED if sway_status == "HIGH SWAY"
-            else YELLOW
+            295,
+            color=sway_color,
+            scale=0.72
+        )
+
+        sidebar_text(
+            sidebar,
+            "From box center: "
+            + waist_displacement_text,
+            325
         )
 
 
-        # Sway-box information
+        # Box dimensions
         sidebar_text(
             sidebar,
-            "SWAY BOX",
-            310,
+            "SWAY BOX SIZE",
+            370,
             color=YELLOW,
-            scale=0.65
+            scale=0.62
         )
 
         sidebar_text(
@@ -932,7 +1014,7 @@ with PoseLandmarker.create_from_options(
             "Width: "
             + str(BOX_WIDTH_PIXELS)
             + " px",
-            340
+            400
         )
 
         sidebar_text(
@@ -940,31 +1022,7 @@ with PoseLandmarker.create_from_options(
             "Height: "
             + str(BOX_HEIGHT_PIXELS)
             + " px",
-            370
-        )
-
-
-        # Displacement
-        sidebar_text(
-            sidebar,
-            "DISPLACEMENT",
-            420,
-            color=YELLOW,
-            scale=0.65
-        )
-
-        sidebar_text(
-            sidebar,
-            "Waist path:",
-            450
-        )
-
-        sidebar_text(
-            sidebar,
-            displacement_text,
-            480,
-            color=PURPLE,
-            scale=0.75
+            430
         )
 
 
@@ -972,72 +1030,70 @@ with PoseLandmarker.create_from_options(
         sidebar_text(
             sidebar,
             "SEGMENT LENGTHS",
-            535,
+            475,
             color=YELLOW,
-            scale=0.65
+            scale=0.62
         )
 
         sidebar_text(
             sidebar,
             "Left thigh: " + left_thigh_text,
-            565
+            505
         )
 
         sidebar_text(
             sidebar,
             "Right thigh: " + right_thigh_text,
-            595
+            535
         )
 
         sidebar_text(
             sidebar,
             "Left shank: " + left_shank_text,
-            625
+            565
         )
 
         sidebar_text(
             sidebar,
             "Right shank: " + right_shank_text,
-            655
+            595
         )
 
 
-        # Knee angles
+        # Angles
         sidebar_text(
             sidebar,
             "KNEE ANGLES",
-            705,
+            640,
             color=YELLOW,
-            scale=0.65
+            scale=0.62
         )
 
         sidebar_text(
             sidebar,
             "Left: " + left_knee_angle_text,
-            735
+            670
         )
 
         sidebar_text(
             sidebar,
             "Right: " + right_knee_angle_text,
-            765
+            700
         )
 
 
-        # Leg visibility note
         sidebar_text(
             sidebar,
             "Legs: " + legs_status,
-            815,
-            color=GREEN if legs_status == "Visible"
-            else RED,
+            745,
+            color=GREEN if legs_status == "Visible" else RED,
             scale=0.6
         )
 
         sidebar_text(
             sidebar,
-            "Lengths shown in pixels",
-            850,
+            "Lengths/displacement are pixels",
+            775,
             color=CYAN,
             scale=0.55
         )
@@ -1048,15 +1104,16 @@ with PoseLandmarker.create_from_options(
             (frame, sidebar)
         )
 
+
         cv2.imshow(
-            "Pose and Motion Tracker",
+            WINDOW_NAME,
             combined_view
         )
 
 
-        # =========================================================
+        # =================================================
         # KEYBOARD CONTROLS
-        # =========================================================
+        # =================================================
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -1068,21 +1125,18 @@ with PoseLandmarker.create_from_options(
 
         elif key == ord("r"):
 
-            # Reset ten-second calibration
+            # Reset calibration
             calibration_start_time = None
             calibration_samples = []
             calibration_complete = False
             sway_box_center = None
 
-            # Reset displacement and movement
-            previous_waist_center = None
-            previous_waist_time = None
-            total_displacement_pixels = 0.0
-            movement_trail = []
-
-            # Reset activity
+            # Reset movement tracking
+            previous_motion_points = {}
+            previous_motion_time = None
             speed_history.clear()
             smoothed_speed_pixels = 0.0
+
             activity_label = "WAITING"
 
             print(
@@ -1091,9 +1145,36 @@ with PoseLandmarker.create_from_options(
             )
 
 
-# =========================================================
+        elif key == ord("f"):
+
+            fullscreen = not fullscreen
+
+            if fullscreen:
+
+                cv2.setWindowProperty(
+                    WINDOW_NAME,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN
+                )
+
+            else:
+
+                cv2.setWindowProperty(
+                    WINDOW_NAME,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_NORMAL
+                )
+
+                cv2.resizeWindow(
+                    WINDOW_NAME,
+                    1600,
+                    850
+                )
+
+
+# =================================================
 # CLOSE PROGRAM
-# =========================================================
+# =================================================
 
 camera.release()
 cv2.destroyAllWindows()
